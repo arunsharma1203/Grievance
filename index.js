@@ -9,7 +9,7 @@ import pkg from "pg";
 const { Pool } = pkg;
  
 dotenv.config(); 
-
+//ok
 const mask = (s) =>
   !s ? "(missing)" : s.length > 12 ? `${s.slice(0, 6)}...${s.slice(-6)}` : s;
 

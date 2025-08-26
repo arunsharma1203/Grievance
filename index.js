@@ -20,6 +20,10 @@ console.log(
   process.env.TELEGRAM_CHAT_ID ? "(set)" : "(missing)"
 );
 console.log(
+  "  TELEGRAM_ADMIN_ID: ",
+  process.env.TELEGRAM_ADMIN_ID ? "(set)" : "(missing)"
+);
+console.log(
   "  DATABASE_URL: ",
   process.env.DATABASE_URL ? "(set)" : "(missing)"
 );
@@ -30,7 +34,6 @@ app.use(express.json());
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // used for notifications
-// ADMIN ID: who is allowed to run /clear (fallback to TELEGRAM_CHAT_ID)
 const TELEGRAM_ADMIN_ID =
   (process.env.TELEGRAM_ADMIN_ID || TELEGRAM_CHAT_ID) + "";
 
@@ -46,8 +49,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Create table if not exists
-const ensureTable = async () => {
+// Create tables if not exists
+const ensureTables = async () => {
+  // grievances (already in your app)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS grievances (
       id TEXT PRIMARY KEY,
@@ -58,9 +62,19 @@ const ensureTable = async () => {
       replied_at TIMESTAMP WITH TIME ZONE
     );
   `);
+
+  // moods table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS moods (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL,
+      value INTEGER NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    );
+  `);
 };
-ensureTable().catch((e) => {
-  console.error("Failed to ensure table:", e);
+ensureTables().catch((e) => {
+  console.error("Failed to ensure tables:", e);
   process.exit(1);
 });
 
@@ -121,10 +135,7 @@ async function pollTelegramUpdates() {
 
       console.log("Telegram message received from", fromChatId, "text:", text);
 
-      // -----------------------
-      // Admin clear flow
-      // -----------------------
-      // If admin sends "/clear" -> ask for confirmation (reply with /confirm_clear)
+      // Admin /clear flow
       if (/^\/clear\b/i.test(text)) {
         if (fromChatId !== TELEGRAM_ADMIN_ID) {
           await sendTelegramTo(
@@ -135,12 +146,10 @@ async function pollTelegramUpdates() {
         }
         await sendTelegramTo(
           fromChatId,
-          "⚠️ Are you sure you want to delete ALL grievances? If yes, reply with:\n/confirm_clear\n\nThis action is irreversible."
+          "⚠️ Are you sure you want to delete ALL grievances and moods? If yes, reply with:\n/confirm_clear\n\nThis action is irreversible."
         );
         continue;
       }
-
-      // If admin sends "/confirm_clear" -> perform deletion
       if (/^\/confirm_clear\b/i.test(text)) {
         if (fromChatId !== TELEGRAM_ADMIN_ID) {
           await sendTelegramTo(
@@ -149,30 +158,29 @@ async function pollTelegramUpdates() {
           );
           continue;
         }
-
         try {
-          const delRes = await pool.query("DELETE FROM grievances");
-          const deletedCount = delRes.rowCount || 0;
+          const delG = await pool.query("DELETE FROM grievances");
+          const delM = await pool.query("DELETE FROM moods");
+          const deletedCountGrievances = delG.rowCount || 0;
+          const deletedCountMoods = delM.rowCount || 0;
           await sendTelegramTo(
             fromChatId,
-            `✅ Deleted ${deletedCount} grievance(s).`
+            `✅ Deleted ${deletedCountGrievances} grievances and ${deletedCountMoods} moods.`
           );
           console.log(
-            `Admin ${fromChatId} cleared ${deletedCount} grievances.`
+            `Admin ${fromChatId} cleared data: grievances=${deletedCountGrievances}, moods=${deletedCountMoods}`
           );
         } catch (err) {
-          console.error("Failed to delete grievances:", err);
+          console.error("Failed to delete data:", err);
           await sendTelegramTo(
             fromChatId,
-            `❌ Failed to delete grievances: ${err.message}`
+            `❌ Failed to delete data: ${err.message}`
           );
         }
         continue;
       }
 
-      // -----------------------
-      // Normal reply parsing (reply <ID> <message> or id:<ID> <message>)
-      // -----------------------
+      // Reply parsing for grievances
       const replyMatch = text.match(/^(?:reply)\s+(\S+)\s+([\s\S]+)/i);
       const idMatch = text.match(/^(?:id[:#]?)\s*(\S+)\s+([\s\S]+)/i);
       let id, replyText;
@@ -183,12 +191,11 @@ async function pollTelegramUpdates() {
         id = idMatch[1];
         replyText = idMatch[2].trim();
       } else {
-        // Not a recognized command — optionally nudge admin for proper format
-        // We'll only send the nudge to admin to avoid spamming others
+        // Not a recognized command — only nudge admin
         if (fromChatId === TELEGRAM_ADMIN_ID) {
           await sendTelegramTo(
             fromChatId,
-            "To reply to a grievance, send:\nreply <GRIEVANCE_ID> <your message>\n\nOr to clear all history send:\n/clear"
+            "Commands:\nreply <GRIEVANCE_ID> <message>\n/clear to delete data\n/confirm_clear to confirm deletion"
           );
         }
         continue;
@@ -241,6 +248,35 @@ app.get("/grievances", async (req, res) => {
   }
 });
 
+// read moods (recent)
+app.get("/moods", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, username, value, created_at FROM moods ORDER BY created_at DESC LIMIT 100`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /moods error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// get latest mood for a user
+app.get("/mood/latest", async (req, res) => {
+  try {
+    const username = req.query.username;
+    if (!username) return res.status(400).json({ error: "username required" });
+    const { rows } = await pool.query(
+      `SELECT id, username, value, created_at FROM moods WHERE username=$1 ORDER BY created_at DESC LIMIT 1`,
+      [username]
+    );
+    res.json(rows[0] || null);
+  } catch (err) {
+    console.error("GET /mood/latest error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // notify (login)
 app.post("/notify", async (req, res) => {
   try {
@@ -267,13 +303,44 @@ app.post("/grievances", async (req, res) => {
       `INSERT INTO grievances(id, username, text) VALUES($1,$2,$3)`,
       [id, username, text]
     );
-    // notify admin with ID
     const tg = await sendTelegramMessage(
       `📢 New grievance from ${username}:\n\n${text}\n\nID: ${id}\n\nReply using:\nreply ${id} <your message>`
     ).catch((e) => ({ ok: false, e }));
     res.json({ ok: true, grievance: { id, username, text }, telegram: tg });
   } catch (err) {
     console.error("POST /grievances error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// create mood
+app.post("/mood", async (req, res) => {
+  try {
+    const { username, value } = req.body;
+    if (!username || typeof value === "undefined")
+      return res.status(400).json({ error: "username and value required" });
+    const v = Number(value);
+    if (!Number.isFinite(v) || v < 0 || v > 10)
+      return res.status(400).json({ error: "value must be 0-10" });
+
+    const insert = await pool.query(
+      `INSERT INTO moods(username, value) VALUES($1,$2) RETURNING id, username, value, created_at`,
+      [username, v]
+    );
+    const row = insert.rows[0];
+
+    // Notify admin via Telegram
+    const tgText = `📊 Mood update from ${username}: ${v}/10\n\nAt: ${new Date(
+      row.created_at
+    ).toLocaleString()}\nID: ${row.id}`;
+    const tg = await sendTelegramMessage(tgText).catch((e) => ({
+      ok: false,
+      e,
+    }));
+
+    res.json({ ok: true, mood: row, telegram: tg });
+  } catch (err) {
+    console.error("POST /mood error:", err);
     res.status(500).json({ error: err.message });
   }
 });

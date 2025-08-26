@@ -30,10 +30,10 @@ console.log(
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "200kb" })); // small limit, diary bodies can be larger if needed
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // used for notifications
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // used for broadcasts/notifications
 const TELEGRAM_ADMIN_ID =
   (process.env.TELEGRAM_ADMIN_ID || TELEGRAM_CHAT_ID) + "";
 
@@ -41,7 +41,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 // Postgres pool
 if (!DATABASE_URL) {
-  console.error("DATABASE_URL is missing. Set it in .env or Render env.");
+  console.error("DATABASE_URL is missing. Set it in .env or your hosting env.");
   process.exit(1);
 }
 const pool = new Pool({
@@ -51,7 +51,7 @@ const pool = new Pool({
 
 // Create tables if not exists
 const ensureTables = async () => {
-  // grievances (already in your app)
+  // grievances (already used by the app)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS grievances (
       id TEXT PRIMARY KEY,
@@ -72,14 +72,34 @@ const ensureTables = async () => {
       created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
     );
   `);
+
+  // diary notes table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS diary_notes (
+      id TEXT PRIMARY KEY,
+      username TEXT,
+      title TEXT,
+      body TEXT,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    );
+  `);
 };
 ensureTables().catch((e) => {
   console.error("Failed to ensure tables:", e);
   process.exit(1);
 });
 
+// Helper: escape HTML for Telegram HTML parse_mode
+function escapeHtml(s = "") {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 // Helper: send message to the configured admin chat (used for notifications)
-async function sendTelegramMessage(text) {
+// supports parse_mode optional ('HTML' or 'Markdown' etc.)
+async function sendTelegramMessage(text, parse_mode = "HTML") {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn("Telegram not configured - skipping send.");
     return { ok: false, reason: "no-telegram-config" };
@@ -88,7 +108,7 @@ async function sendTelegramMessage(text) {
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
+    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode }),
   });
   const data = await resp.json();
   if (!data.ok) console.error("Telegram API error:", data);
@@ -96,7 +116,7 @@ async function sendTelegramMessage(text) {
 }
 
 // Helper: send message to a specific chat id (useful to reply to the chat which sent a command)
-async function sendTelegramTo(chatId, text) {
+async function sendTelegramTo(chatId, text, parse_mode = "HTML") {
   if (!TELEGRAM_BOT_TOKEN) {
     console.warn("Telegram not configured - skipping sendTelegramTo.");
     return { ok: false, reason: "no-telegram-config" };
@@ -105,14 +125,14 @@ async function sendTelegramTo(chatId, text) {
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode }),
   });
   const data = await resp.json();
   if (!data.ok) console.error("Telegram API error:", data);
   return data;
 }
 
-// Polling getUpdates for replies and admin commands
+// Polling getUpdates for replies and admin commands (your existing logic)
 let tgUpdateOffset = 0;
 async function pollTelegramUpdates() {
   if (!TELEGRAM_BOT_TOKEN) return;
@@ -146,7 +166,7 @@ async function pollTelegramUpdates() {
         }
         await sendTelegramTo(
           fromChatId,
-          "⚠️ Are you sure you want to delete ALL grievances and moods? If yes, reply with:\n/confirm_clear\n\nThis action is irreversible."
+          "⚠️ Are you sure you want to delete ALL grievances, moods and diary notes? If yes, reply with:\n/confirm_clear\n\nThis action is irreversible."
         );
         continue;
       }
@@ -161,14 +181,16 @@ async function pollTelegramUpdates() {
         try {
           const delG = await pool.query("DELETE FROM grievances");
           const delM = await pool.query("DELETE FROM moods");
+          const delD = await pool.query("DELETE FROM diary_notes");
           const deletedCountGrievances = delG.rowCount || 0;
           const deletedCountMoods = delM.rowCount || 0;
+          const deletedCountDiary = delD.rowCount || 0;
           await sendTelegramTo(
             fromChatId,
-            `✅ Deleted ${deletedCountGrievances} grievances and ${deletedCountMoods} moods.`
+            `✅ Deleted ${deletedCountGrievances} grievances, ${deletedCountMoods} moods and ${deletedCountDiary} diary notes.`
           );
           console.log(
-            `Admin ${fromChatId} cleared data: grievances=${deletedCountGrievances}, moods=${deletedCountMoods}`
+            `Admin ${fromChatId} cleared data: grievances=${deletedCountGrievances}, moods=${deletedCountMoods}, diary=${deletedCountDiary}`
           );
         } catch (err) {
           console.error("Failed to delete data:", err);
@@ -180,7 +202,7 @@ async function pollTelegramUpdates() {
         continue;
       }
 
-      // Reply parsing for grievances
+      // Reply parsing for grievances (same as before)
       const replyMatch = text.match(/^(?:reply)\s+(\S+)\s+([\s\S]+)/i);
       const idMatch = text.match(/^(?:id[:#]?)\s*(\S+)\s+([\s\S]+)/i);
       let id, replyText;
@@ -195,8 +217,32 @@ async function pollTelegramUpdates() {
         if (fromChatId === TELEGRAM_ADMIN_ID) {
           await sendTelegramTo(
             fromChatId,
-            "Commands:\nreply <GRIEVANCE_ID> <message>\n/clear to delete data\n/confirm_clear to confirm deletion"
+            "Commands:\nreply <GRIEVANCE_ID> <message>\n/clear to delete data\n/confirm_clear to confirm deletion\n\n(You can also delete a diary note by sending: delete_diary <id>)"
           );
+        }
+        // Also support admin deleting diary via `delete_diary <id>`
+        const delDiaryMatch = text.match(/^delete_diary\s+(\S+)/i);
+        if (delDiaryMatch && fromChatId === TELEGRAM_ADMIN_ID) {
+          const delId = delDiaryMatch[1];
+          try {
+            const r = await pool.query(
+              "DELETE FROM diary_notes WHERE id=$1 RETURNING *",
+              [delId]
+            );
+            if (r.rowCount === 0) {
+              await sendTelegramTo(
+                fromChatId,
+                `No diary note found with ID ${delId}.`
+              );
+            } else {
+              await sendTelegramTo(fromChatId, `Deleted diary note ${delId}.`);
+            }
+          } catch (err) {
+            await sendTelegramTo(
+              fromChatId,
+              `Failed to delete diary ${delId}: ${err.message}`
+            );
+          }
         }
         continue;
       }
@@ -235,7 +281,7 @@ setInterval(() => {
 // health
 app.get("/", (req, res) => res.json({ ok: true }));
 
-// read grievances (ordered newest first)
+// read grievances (ordered oldest-first for UI continuity)
 app.get("/grievances", async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -283,7 +329,7 @@ app.post("/notify", async (req, res) => {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: "username required" });
     const tg = await sendTelegramMessage(
-      `✅ Login: ${username} (${new Date().toLocaleString()})`
+      `✅ Login: ${escapeHtml(username)} (${new Date().toLocaleString()})`
     );
     res.json({ ok: true, telegram: tg });
   } catch (err) {
@@ -304,7 +350,11 @@ app.post("/grievances", async (req, res) => {
       [id, username, text]
     );
     const tg = await sendTelegramMessage(
-      `📢 New grievance from ${username}:\n\n${text}\n\nID: ${id}\n\nReply using:\nreply ${id} <your message>`
+      `📢 New grievance from ${escapeHtml(username)}:\n\n${escapeHtml(
+        text
+      )}\n\nID: ${escapeHtml(id)}\n\nReply using:\nreply ${escapeHtml(
+        id
+      )} <your message>`
     ).catch((e) => ({ ok: false, e }));
     res.json({ ok: true, grievance: { id, username, text }, telegram: tg });
   } catch (err) {
@@ -330,9 +380,11 @@ app.post("/mood", async (req, res) => {
     const row = insert.rows[0];
 
     // Notify admin via Telegram
-    const tgText = `📊 Mood update from ${username}: ${v}/10\n\nAt: ${new Date(
-      row.created_at
-    ).toLocaleString()}\nID: ${row.id}`;
+    const tgText = `📊 Mood update from ${escapeHtml(
+      username
+    )}: ${v}/10\n\nAt: ${escapeHtml(
+      new Date(row.created_at).toLocaleString()
+    )}\nID: ${row.id}`;
     const tg = await sendTelegramMessage(tgText).catch((e) => ({
       ok: false,
       e,
@@ -359,6 +411,80 @@ app.post("/grievances/:id/reply", async (req, res) => {
     res.json({ ok: true, grievance: r.rows[0] });
   } catch (err) {
     console.error("POST /grievances/:id/reply error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---- Diary endpoints ----
+
+// create a diary note: stores in DB and forwards to Telegram (so others can see)
+app.post("/diary", async (req, res) => {
+  try {
+    const { username, title, body } = req.body;
+    if (!body || !body.trim())
+      return res.status(400).json({ error: "body required" });
+
+    const id = Date.now().toString();
+    const t = new Date().toISOString();
+
+    await pool.query(
+      `INSERT INTO diary_notes(id, username, title, body, created_at) VALUES($1,$2,$3,$4,$5)`,
+      [id, username || null, title || null, body, t]
+    );
+
+    // forward to Telegram for group visibility
+    let tgRes = null;
+    if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+      const text = `<b>Bittu's Diary</b>\n<b>${escapeHtml(
+        title || "Untitled"
+      )}</b>\n<i>${escapeHtml(
+        new Date(t).toLocaleString()
+      )}</i>\n\n${escapeHtml(body)}`;
+      tgRes = await sendTelegramMessage(text, "HTML").catch((e) => ({
+        ok: false,
+        e,
+      }));
+    }
+
+    res.json({
+      ok: true,
+      note: { id, username, title, body, created_at: t },
+      telegram: tgRes,
+    });
+  } catch (err) {
+    console.error("POST /diary error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// read recent diary notes (public)
+app.get("/diary", async (req, res) => {
+  try {
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "20")));
+    const { rows } = await pool.query(
+      `SELECT id, username, title, body, created_at FROM diary_notes ORDER BY created_at DESC LIMIT $1`,
+      [limit]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /diary error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// optional admin-only delete diary note (via API)
+// note: in production add auth (API key, OAuth, etc.)
+app.delete("/diary/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const r = await pool.query(
+      "DELETE FROM diary_notes WHERE id=$1 RETURNING *",
+      [id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true, deleted: r.rows[0] });
+  } catch (err) {
+    console.error("DELETE /diary/:id error:", err);
     res.status(500).json({ error: err.message });
   }
 });

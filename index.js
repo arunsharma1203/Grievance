@@ -7,9 +7,9 @@ import dotenv from "dotenv";
 import fetch from "node-fetch";
 import pkg from "pg";
 const { Pool } = pkg;
- 
-dotenv.config(); 
-//okjjjj
+
+dotenv.config();
+
 const mask = (s) =>
   !s ? "(missing)" : s.length > 12 ? `${s.slice(0, 6)}...${s.slice(-6)}` : s;
 
@@ -25,11 +25,15 @@ console.log(
 );
 
 const app = express();
-app.use(cors()); 
-app.use(express.json()); 
+app.use(cors());
+app.use(express.json());
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // used for notifications
+// ADMIN ID: who is allowed to run /clear (fallback to TELEGRAM_CHAT_ID)
+const TELEGRAM_ADMIN_ID =
+  (process.env.TELEGRAM_ADMIN_ID || TELEGRAM_CHAT_ID) + "";
+
 const DATABASE_URL = process.env.DATABASE_URL;
 
 // Postgres pool
@@ -60,7 +64,7 @@ ensureTable().catch((e) => {
   process.exit(1);
 });
 
-// Telegram helper
+// Helper: send message to the configured admin chat (used for notifications)
 async function sendTelegramMessage(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn("Telegram not configured - skipping send.");
@@ -77,7 +81,24 @@ async function sendTelegramMessage(text) {
   return data;
 }
 
-// Polling getUpdates for replies (same parsing rules you already have)
+// Helper: send message to a specific chat id (useful to reply to the chat which sent a command)
+async function sendTelegramTo(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.warn("Telegram not configured - skipping sendTelegramTo.");
+    return { ok: false, reason: "no-telegram-config" };
+  }
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+  const data = await resp.json();
+  if (!data.ok) console.error("Telegram API error:", data);
+  return data;
+}
+
+// Polling getUpdates for replies and admin commands
 let tgUpdateOffset = 0;
 async function pollTelegramUpdates() {
   if (!TELEGRAM_BOT_TOKEN) return;
@@ -95,7 +116,63 @@ async function pollTelegramUpdates() {
       const msg = update.message || update.edited_message;
       if (!msg || !msg.text) continue;
       const text = msg.text.trim();
-      // parse: "reply <ID> <message>"  or "id:<ID> <message>"
+      const fromChatId =
+        msg.chat && msg.chat.id ? msg.chat.id.toString() : null;
+
+      console.log("Telegram message received from", fromChatId, "text:", text);
+
+      // -----------------------
+      // Admin clear flow
+      // -----------------------
+      // If admin sends "/clear" -> ask for confirmation (reply with /confirm_clear)
+      if (/^\/clear\b/i.test(text)) {
+        if (fromChatId !== TELEGRAM_ADMIN_ID) {
+          await sendTelegramTo(
+            fromChatId,
+            "⛔ You are not authorized to clear history."
+          );
+          continue;
+        }
+        await sendTelegramTo(
+          fromChatId,
+          "⚠️ Are you sure you want to delete ALL grievances? If yes, reply with:\n/confirm_clear\n\nThis action is irreversible."
+        );
+        continue;
+      }
+
+      // If admin sends "/confirm_clear" -> perform deletion
+      if (/^\/confirm_clear\b/i.test(text)) {
+        if (fromChatId !== TELEGRAM_ADMIN_ID) {
+          await sendTelegramTo(
+            fromChatId,
+            "⛔ You are not authorized to clear history."
+          );
+          continue;
+        }
+
+        try {
+          const delRes = await pool.query("DELETE FROM grievances");
+          const deletedCount = delRes.rowCount || 0;
+          await sendTelegramTo(
+            fromChatId,
+            `✅ Deleted ${deletedCount} grievance(s).`
+          );
+          console.log(
+            `Admin ${fromChatId} cleared ${deletedCount} grievances.`
+          );
+        } catch (err) {
+          console.error("Failed to delete grievances:", err);
+          await sendTelegramTo(
+            fromChatId,
+            `❌ Failed to delete grievances: ${err.message}`
+          );
+        }
+        continue;
+      }
+
+      // -----------------------
+      // Normal reply parsing (reply <ID> <message> or id:<ID> <message>)
+      // -----------------------
       const replyMatch = text.match(/^(?:reply)\s+(\S+)\s+([\s\S]+)/i);
       const idMatch = text.match(/^(?:id[:#]?)\s*(\S+)\s+([\s\S]+)/i);
       let id, replyText;
@@ -106,10 +183,14 @@ async function pollTelegramUpdates() {
         id = idMatch[1];
         replyText = idMatch[2].trim();
       } else {
-        // optional: nudge admin about correct format
-        await sendTelegramMessage(
-          "To reply to a grievance send:\nreply <GRIEVANCE_ID> <your message>"
-        );
+        // Not a recognized command — optionally nudge admin for proper format
+        // We'll only send the nudge to admin to avoid spamming others
+        if (fromChatId === TELEGRAM_ADMIN_ID) {
+          await sendTelegramTo(
+            fromChatId,
+            "To reply to a grievance, send:\nreply <GRIEVANCE_ID> <your message>\n\nOr to clear all history send:\n/clear"
+          );
+        }
         continue;
       }
 
@@ -118,15 +199,18 @@ async function pollTelegramUpdates() {
         const q = `UPDATE grievances SET reply = $1, replied_at = now() WHERE id = $2 RETURNING *`;
         const r = await pool.query(q, [replyText, id]);
         if (r.rowCount === 0) {
-          await sendTelegramMessage(`No grievance found with ID ${id}.`);
+          await sendTelegramTo(fromChatId, `No grievance found with ID ${id}.`);
           continue;
         }
-        await sendTelegramMessage(
+        await sendTelegramTo(
+          fromChatId,
           `Reply recorded for grievance ID ${id}:\n\n${replyText}`
         );
+        console.log(`Recorded reply for grievance ${id}`);
       } catch (err) {
         console.error("Failed to record reply:", err);
-        await sendTelegramMessage(
+        await sendTelegramTo(
+          fromChatId,
           `Failed to record reply for ${id}: ${err.message}`
         );
       }
